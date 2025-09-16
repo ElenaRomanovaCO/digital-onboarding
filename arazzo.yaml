@@ -1,0 +1,459 @@
+arazzo: 1.0.0
+info:
+  title: Digital Onboarding API Integration Workflows
+  version: 1.0.0
+  description: Arazzo specifications for integrating with Digital Onboarding platform workflows
+sourceDescriptions:
+  - name: digital-onboarding-api
+    url: https://api.digitalonboarding.com
+    type: openapi
+
+workflows:
+  
+  # Workflow 1: Complete Customer Onboarding Flow
+  - workflowId: complete-customer-onboarding
+    summary: End-to-end customer onboarding from contact creation to journey initiation
+    description: Creates a new contact, associates accounts, and triggers onboarding journey
+    inputs:
+      type: object
+      properties:
+        customer_data:
+          type: object
+          properties:
+            unique_id: {type: string}
+            name_first: {type: string}
+            name_last: {type: string}
+            email: {type: string}
+            phone_mobile: {type: string}
+            timezone: {type: string}
+        account_data:
+          type: object
+          properties:
+            account_number: {type: string}
+            product:
+              type: object
+              properties:
+                code: {type: string}
+                type: {type: string}
+                name: {type: string}
+            balance: {type: number}
+        template_id: {type: string}
+    steps:
+      - stepId: authenticate
+        description: Get OAuth2 access token
+        operationId: digital-onboarding-api#/oauth2/token
+        requestBody:
+          contentType: application/x-www-form-urlencoded
+          payload:
+            grant_type: client_credentials
+            client_id: $inputs.client_id
+            client_secret: $inputs.client_secret
+        successCriteria:
+          - condition: $statusCode == 200
+        outputs:
+          access_token: $response.body.access_token
+          
+      - stepId: create-contact
+        description: Create or update customer contact
+        dependsOn: authenticate
+        operationId: digital-onboarding-api#/v1/contacts
+        parameters:
+          - name: Authorization
+            in: header
+            value: "Bearer {$steps.authenticate.outputs.access_token}"
+        requestBody:
+          contentType: application/json
+          payload:
+            unique_id: $inputs.customer_data.unique_id
+            name_first: $inputs.customer_data.name_first
+            name_last: $inputs.customer_data.name_last
+            email: $inputs.customer_data.email
+            phone_mobile: $inputs.customer_data.phone_mobile
+            timezone: $inputs.customer_data.timezone
+            email_authorized: true
+            email_opted_in: true
+            email_verified: true
+            sms_authorized: true
+            sms_opted_in: true
+            sms_verified: true
+        successCriteria:
+          - condition: $statusCode == 201 || $statusCode == 200
+        outputs:
+          contact_id: $response.body.id
+          
+      - stepId: create-account-batch
+        description: Associate account with contact
+        dependsOn: create-contact
+        operationId: digital-onboarding-api#/v1/batches
+        parameters:
+          - name: Authorization
+            in: header
+            value: "Bearer {$steps.authenticate.outputs.access_token}"
+        requestBody:
+          contentType: application/json
+          payload:
+            type: accounts
+            records:
+              - account_number: $inputs.account_data.account_number
+                contact:
+                  unique_id: $inputs.customer_data.unique_id
+                  role: primary
+                product: $inputs.account_data.product
+                balance: $inputs.account_data.balance
+                opened_date: $util.currentDate()
+        successCriteria:
+          - condition: $statusCode == 201
+        outputs:
+          batch_id: $response.body.batch_id
+          
+      - stepId: create-journey
+        description: Start onboarding journey for contact
+        dependsOn: create-account-batch
+        operationId: digital-onboarding-api#/v1/templates/{template_id}/journeys
+        parameters:
+          - name: template_id
+            in: path
+            value: $inputs.template_id
+          - name: Authorization
+            in: header
+            value: "Bearer {$steps.authenticate.outputs.access_token}"
+        requestBody:
+          contentType: application/json
+          payload:
+            contact:
+              unique_id: $inputs.customer_data.unique_id
+            source: api
+        successCriteria:
+          - condition: $statusCode == 201
+        outputs:
+          journey_id: $response.body.id
+          journey_url: $response.body.web_client_url
+    outputs:
+      contact_id: $steps.create-contact.outputs.contact_id
+      journey_id: $steps.create-journey.outputs.journey_id
+      journey_url: $steps.create-journey.outputs.journey_url
+
+  # Workflow 2: Service Enrollment Campaign
+  - workflowId: service-enrollment-campaign  
+    summary: Drive adoption of specific services like direct deposit or eStatements
+    description: Creates targeted campaigns for existing customers to adopt new services
+    inputs:
+      type: object
+      properties:
+        contact_unique_ids: 
+          type: array
+          items: {type: string}
+        service_template_id: {type: string}
+        enrollment_type: {type: string} # direct_deposit, estatements, mobile_banking
+    steps:
+      - stepId: authenticate
+        description: Get OAuth2 access token
+        operationId: digital-onboarding-api#/oauth2/token
+        requestBody:
+          contentType: application/x-www-form-urlencoded
+          payload:
+            grant_type: client_credentials
+        successCriteria:
+          - condition: $statusCode == 200
+        outputs:
+          access_token: $response.body.access_token
+          
+      - stepId: create-bulk-journeys
+        description: Create service enrollment journeys for multiple contacts
+        dependsOn: authenticate
+        forEach: $inputs.contact_unique_ids
+        operationId: digital-onboarding-api#/v1/templates/{template_id}/journeys
+        parameters:
+          - name: template_id
+            in: path
+            value: $inputs.service_template_id
+          - name: Authorization
+            in: header
+            value: "Bearer {$steps.authenticate.outputs.access_token}"
+        requestBody:
+          contentType: application/json
+          payload:
+            contact:
+              unique_id: $forEach.item
+            source: api
+            meta_public:
+              enrollment_type: $inputs.enrollment_type
+        successCriteria:
+          - condition: $statusCode == 201
+        outputs:
+          journey_ids: $response.body[*].id
+          
+      - stepId: track-enrollment-progress
+        description: Monitor journey completion status
+        dependsOn: create-bulk-journeys
+        operationId: digital-onboarding-api#/v1/journeys
+        parameters:
+          - name: Authorization
+            in: header
+            value: "Bearer {$steps.authenticate.outputs.access_token}"
+        successCriteria:
+          - condition: $statusCode == 200
+        outputs:
+          active_journeys: $response.body[?(@.analytics_cache.is_completed == false)]
+          completed_journeys: $response.body[?(@.analytics_cache.is_completed == true)]
+    outputs:
+      enrollment_metrics:
+        total_initiated: $steps.create-bulk-journeys.outputs.journey_ids.length
+        completed_count: $steps.track-enrollment-progress.outputs.completed_journeys.length
+        in_progress_count: $steps.track-enrollment-progress.outputs.active_journeys.length
+
+  # Workflow 3: Customer Retention & Re-engagement
+  - workflowId: customer-retention-reengagement
+    summary: Re-engage dormant customers and prevent attrition
+    description: Identifies inactive customers and triggers retention campaigns
+    inputs:
+      type: object
+      properties:
+        dormant_contact_criteria:
+          type: object
+          properties:
+            days_inactive: {type: integer}
+            account_balance_min: {type: number}
+        retention_template_id: {type: string}
+        offer_details:
+          type: object
+          properties:
+            offer_type: {type: string}
+            incentive_amount: {type: number}
+    steps:
+      - stepId: authenticate
+        description: Get OAuth2 access token
+        operationId: digital-onboarding-api#/oauth2/token
+        requestBody:
+          contentType: application/x-www-form-urlencoded
+          payload:
+            grant_type: client_credentials
+        successCriteria:
+          - condition: $statusCode == 200
+        outputs:
+          access_token: $response.body.access_token
+          
+      - stepId: identify-dormant-contacts
+        description: Query contacts based on inactivity criteria
+        dependsOn: authenticate
+        operationId: digital-onboarding-api#/v1/contacts
+        parameters:
+          - name: Authorization
+            in: header
+            value: "Bearer {$steps.authenticate.outputs.access_token}"
+          - name: search
+            in: query
+            value: inactive_days:>{$inputs.dormant_contact_criteria.days_inactive}
+        successCriteria:
+          - condition: $statusCode == 200
+        outputs:
+          dormant_contacts: $response.body
+          
+      - stepId: create-retention-campaigns
+        description: Launch retention journeys for dormant contacts
+        dependsOn: identify-dormant-contacts
+        forEach: $steps.identify-dormant-contacts.outputs.dormant_contacts
+        operationId: digital-onboarding-api#/v1/templates/{template_id}/journeys
+        parameters:
+          - name: template_id
+            in: path
+            value: $inputs.retention_template_id
+          - name: Authorization
+            in: header
+            value: "Bearer {$steps.authenticate.outputs.access_token}"
+        requestBody:
+          contentType: application/json
+          payload:
+            contact:
+              unique_id: $forEach.item.unique_id
+            source: automatic-targeting
+            meta_public:
+              offer_type: $inputs.offer_details.offer_type
+              incentive_amount: $inputs.offer_details.incentive_amount
+              days_dormant: $inputs.dormant_contact_criteria.days_inactive
+        successCriteria:
+          - condition: $statusCode == 201
+        outputs:
+          retention_journeys: $response.body[*].id
+    outputs:
+      retention_summary:
+        dormant_customers_identified: $steps.identify-dormant-contacts.outputs.dormant_contacts.length
+        retention_campaigns_launched: $steps.create-retention-campaigns.outputs.retention_journeys.length
+
+  # Workflow 4: Product Cross-selling & Relationship Expansion  
+  - workflowId: product-cross-selling
+    summary: Convert single-product customers to full banking relationships
+    description: Analyzes customer profiles and triggers relevant product offers
+    inputs:
+      type: object
+      properties:
+        target_segment: {type: string} # deposit_only, loan_only, single_product
+        cross_sell_template_id: {type: string}
+        product_recommendations:
+          type: array
+          items:
+            type: object
+            properties:
+              product_type: {type: string}
+              eligibility_criteria: {type: object}
+    steps:
+      - stepId: authenticate
+        description: Get OAuth2 access token
+        operationId: digital-onboarding-api#/oauth2/token
+        requestBody:
+          contentType: application/x-www-form-urlencoded
+          payload:
+            grant_type: client_credentials
+        successCriteria:
+          - condition: $statusCode == 200
+        outputs:
+          access_token: $response.body.access_token
+          
+      - stepId: segment-customers
+        description: Identify customers matching cross-sell criteria
+        dependsOn: authenticate
+        operationId: digital-onboarding-api#/v1/contacts
+        parameters:
+          - name: Authorization
+            in: header
+            value: "Bearer {$steps.authenticate.outputs.access_token}"
+          - name: search
+            in: query
+            value: segment:$inputs.target_segment
+        successCriteria:
+          - condition: $statusCode == 200
+        outputs:
+          target_customers: $response.body
+          
+      - stepId: get-customer-accounts
+        description: Analyze existing accounts for each target customer
+        dependsOn: segment-customers
+        forEach: $steps.segment-customers.outputs.target_customers
+        operationId: digital-onboarding-api#/v1/contacts/{contact_id}/accounts
+        parameters:
+          - name: contact_id
+            in: path
+            value: $forEach.item.id
+          - name: Authorization
+            in: header
+            value: "Bearer {$steps.authenticate.outputs.access_token}"
+        successCriteria:
+          - condition: $statusCode == 200
+        outputs:
+          customer_account_profiles: $response.body
+          
+      - stepId: create-cross-sell-campaigns
+        description: Launch personalized cross-sell journeys
+        dependsOn: get-customer-accounts
+        forEach: $steps.segment-customers.outputs.target_customers
+        operationId: digital-onboarding-api#/v1/templates/{template_id}/journeys
+        parameters:
+          - name: template_id
+            in: path
+            value: $inputs.cross_sell_template_id
+          - name: Authorization
+            in: header
+            value: "Bearer {$steps.authenticate.outputs.access_token}"
+        requestBody:
+          contentType: application/json
+          payload:
+            contact:
+              unique_id: $forEach.item.unique_id
+            source: automatic-targeting
+            meta_public:
+              recommended_products: $inputs.product_recommendations
+              current_relationship: $inputs.target_segment
+        successCriteria:
+          - condition: $statusCode == 201
+        outputs:
+          cross_sell_journeys: $response.body[*].id
+    outputs:
+      cross_sell_metrics:
+        eligible_customers: $steps.segment-customers.outputs.target_customers.length
+        campaigns_launched: $steps.create-cross-sell-campaigns.outputs.cross_sell_journeys.length
+
+  # Workflow 5: Journey Completion Tracking & Analytics
+  - workflowId: journey-completion-tracking
+    summary: Monitor and update journey completion status
+    description: Tracks customer progress and marks journeys as complete when objectives are met
+    inputs:
+      type: object
+      properties:
+        template_id: {type: string}
+        tracking_period_days: {type: integer}
+        completion_criteria:
+          type: object
+          properties:
+            objective_key: {type: string}
+            completion_threshold: {type: number}
+    steps:
+      - stepId: authenticate
+        description: Get OAuth2 access token
+        operationId: digital-onboarding-api#/oauth2/token
+        requestBody:
+          contentType: application/x-www-form-urlencoded
+          payload:
+            grant_type: client_credentials
+        successCriteria:
+          - condition: $statusCode == 200
+        outputs:
+          access_token: $response.body.access_token
+          
+      - stepId: get-active-journeys
+        description: Retrieve all active journeys for tracking
+        dependsOn: authenticate
+        operationId: digital-onboarding-api#/v1/journeys
+        parameters:
+          - name: Authorization
+            in: header
+            value: "Bearer {$steps.authenticate.outputs.access_token}"
+        successCriteria:
+          - condition: $statusCode == 200
+        outputs:
+          active_journeys: $response.body[?(@.analytics_cache.is_completed == false)]
+          
+      - stepId: update-completed-journeys
+        description: Mark journeys as completed based on criteria
+        dependsOn: get-active-journeys
+        forEach: $steps.get-active-journeys.outputs.active_journeys[?(@.analytics_cache.pages_completed.length >= $inputs.completion_criteria.completion_threshold)]
+        operationId: digital-onboarding-api#/v1/templates/{template_id}/journeys/{journey_id}
+        parameters:
+          - name: template_id
+            in: path
+            value: $inputs.template_id
+          - name: journey_id
+            in: path
+            value: $forEach.item.id
+          - name: Authorization
+            in: header
+            value: "Bearer {$steps.authenticate.outputs.access_token}"
+        requestBody:
+          contentType: application/json
+          payload:
+            is_completion_confirmed: true
+        successCriteria:
+          - condition: $statusCode == 200
+        outputs:
+          completed_journey_ids: $response.body[*].id
+          
+      - stepId: get-journey-analytics
+        description: Generate completion analytics
+        dependsOn: update-completed-journeys
+        operationId: digital-onboarding-api#/v1/templates/{template_id}
+        parameters:
+          - name: template_id
+            in: path  
+            value: $inputs.template_id
+          - name: Authorization
+            in: header
+            value: "Bearer {$steps.authenticate.outputs.access_token}"
+        successCriteria:
+          - condition: $statusCode == 200
+        outputs:
+          template_analytics: $response.body.analytics
+    outputs:
+      completion_metrics:
+        total_active_journeys: $steps.get-active-journeys.outputs.active_journeys.length
+        newly_completed: $steps.update-completed-journeys.outputs.completed_journey_ids.length
+        completion_rate: $steps.update-completed-journeys.outputs.completed_journey_ids.length / $steps.get-active-journeys.outputs.active_journeys.length
+        template_performance: $steps.get-journey-analytics.outputs.template_analytics
